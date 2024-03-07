@@ -2,27 +2,20 @@ import { decodeBase64 } from "https://deno.land/std@0.218.2/encoding/base64.ts";
 import * as cf from "./cloudflare.js";
 
 const textDecoder = new TextDecoder();
-
-const kv = await Deno.openKv();
-
-const bwspeedportAuth = {
-    username: "speedportbw",
-    password: "nfz2KOagkr4JAwyvOCr33j0K08Yv5TGP"
-};
-
-const hostnames = {
-    "bw.cyra.pink": {
-        records: ["A", "AAAA"],
-        v4alt: "bw4.cyra.pink",
-        v6alt: null,
-        auth: [bwspeedportAuth]
+const kv = await Deno.openKv(Deno.env.get("KV_PATH"));
+let config;
+{
+    const configLocation = Deno.env.get("CONFIG_JS_PATH");
+    if (configLocation !== undefined) {
+        config = (await import(configLocation)).default;
+    } else {
+        config = JSON.parse(Deno.env.get("CONFIG_JSON"));
     }
-};
+}
+console.log("Hello from global scope! Current config:", config);
 
 Deno.serve(async req => {
-    console.log(req);
     const url = new URL(req.url);
-    console.log(url);
     if (url.pathname !== "/nic/update") {
         return new Response("404", { status: 404 });
     }
@@ -43,14 +36,15 @@ Deno.serve(async req => {
     } catch {
         return new Response("badauth");
     }
+    // Note that "".split(",") === [""] , so we get badauth when no hostnames are given
     const hostNamesToUpdate = hostnameParam.split(",");
-    console.log(hostNamesToUpdate, username, password);
+    // All hostnames listed must be known and must be accessible for the given username and password
     if (
         !hostNamesToUpdate.every(
             name =>
-                (hostnames[name]?.auth.findIndex(
+                (config.names[name]?.auth.findIndex(
                     auth => auth.username === username && auth.password === password
-                ) ?? 0) >= 0
+                ) ?? -1) >= 0
         )
     ) {
         return new Response("badauth");
@@ -72,106 +66,107 @@ Deno.serve(async req => {
             if (newIpv4 !== null) atomic.set(["toUpdate", hostname, "A"], newIpv4);
             if (newIpv6 !== null) atomic.set(["toUpdate", hostname, "AAAA"], newIpv6);
         }
-        atomic.enqueue({ kind: "update", retryId: null });
+        atomic.enqueue({ kind: "update", nRetry: 0, skipLock: false });
         ok = (await atomic.commit()).ok;
-        console.log(ok);
     }
 
     return new Response(returnCodes.join("\n"));
 });
 
 kv.listenQueue(async message => {
+    console.log("queue listener entered with message", message);
+
     if (message.kind !== "update") return;
 
-    const [retryId, _retryN] = await kv.getMany([["nextRetryId"], ["nextRetryN"]]);
-    console.log("Queue handler entered with retryId", retryId);
+    const skipLock = message.skipLock;
 
-    // if nextRetryId in the db is not null it means there was previously some failure with cloudflare
-    // and a retry is queued up. In this case, we skip the regular handling of incoming update requests
-    // and let the queued up retry eventually deal with it.
-    if (retryId.value !== message.retryId) return;
-
-    let ok = false;
-    let toUpdateEntries;
-    while (!ok) {
-        toUpdateEntries = [];
-        const iter = kv.list({ prefix: ["toUpdate"] });
-        for await (const v of iter) toUpdateEntries.push(v);
+    let toUpdateEntries = null;
+    while (true) {
+        const [lockedEntry, queuedEntry] = await kv.getMany([
+            ["queue", "locked"],
+            ["queue", "queued"]
+        ]);
+        const locked = lockedEntry.value ?? false;
         const atomic = kv.atomic();
-        atomic.check(...toUpdateEntries);
-        toUpdateEntries.forEach(v => atomic.delete(v.key));
-        ok = (await atomic.commit()).ok;
+        atomic.check(lockedEntry);
+        // I think this check isn't really necessary but it helps me sleep at night
+        atomic.check(queuedEntry);
+        if (locked && !skipLock) {
+            toUpdateEntries = null;
+            atomic.set(["queue", "queued"], true);
+        } else {
+            toUpdateEntries = [];
+            for await (const v of kv.list({ prefix: ["toUpdate"] })) {
+                toUpdateEntries.push(v);
+            }
+            atomic.set(["queue", "queued"], false);
+            atomic.set(["queue", "locked"], true);
+        }
+        if ((await atomic.commit()).ok) {
+            break;
+        }
     }
+    if (toUpdateEntries === null) {
+        console.log("leaving queue listener early because it's locked");
+        return;
+    }
+    // TODO its a bit suboptimal that if any uncaught error happens below this point,
+    // the queue listener never gets unlocked and is broken forever
 
-    const toUpdate = toUpdateEntries.map(v => ({
-        name: v.key[1],
-        type: v.key[2],
-        value: v.value,
-        entry: v
-    }));
-    console.log("entries to update", toUpdate);
-
-    const retryList = [];
+    const commitPromises = [];
+    // TODO we might want to be smarter about caching than this
     const zCache = {};
     const rCache = {};
-    for (const [i, candidate] of toUpdate.entries()) {
+    for (const entry of toUpdateEntries) {
+        const recordContent = entry.value;
+        const recordName = entry.key[1];
+        const recordType = entry.key[2];
+
         try {
-            const record = await cf.findRecord(zCache, rCache, candidate.name, candidate.type);
+            const record = await cf.findRecord(zCache, rCache, recordName, recordType);
             if (record === null) {
-                console.log("skipping record because not found", candidate.name, candidate.type);
+                console.log("skipping record because not found", recordName, recordType);
+                commitPromises.push(kv.atomic().check(entry).delete(entry.key).commit());
                 continue;
             }
-            record.content = candidate.value;
+            record.content = recordContent;
             await cf.updateRecord(rCache, record);
+            console.log("successful update for", recordName, recordType, recordContent);
         } catch (err) {
             console.log("caught error", err);
             // TODO cause a retry on other conditions, like network failures?
             if (err?.statusCode === 500) {
-                retryList = toUpdate.slice(i);
                 break;
             } else {
                 console.log("error was probably client's fault, ignoring");
             }
         }
+        commitPromises.push(kv.atomic().check(entry).delete(entry.key).commit());
     }
-    console.log("queuing retries", retryList);
 
-    // We know we're done if the current handler call was a regular update (not a retry) and no new retries are necessary.
-    if (retryId.value === null && retryList.length <= 0) {
+    await Promise.all(commitPromises);
+
+    const queueRetry = commitPromises.length < toUpdateEntries.length;
+    if (queueRetry) {
+        kv.enqueue(
+            { kind: "update", nRetry: Math.min(message.nRetry + 1, 7), skipLock: true },
+            { delay: Math.ceil((1.4 ** message.nRetry - 1) * 25) * 1000 }
+        );
         return;
     }
 
-    ok = false;
-    while (!ok && retryList.length > 0) {
+    while (true) {
+        const queuedEntry = await kv.get(["queue", "queued"]);
+        const queued = queuedEntry.value ?? false;
         const atomic = kv.atomic();
-        for (const retry of retryList) {
-            await atomic.set(retry.key, retry.value);
+        atomic.check(queuedEntry);
+        if (queued) {
+            atomic.enqueue({ kind: "update", nRetry: 0, skipLock: true });
+        } else {
+            atomic.set(["queue", "locked"], false);
         }
-        ok = (await atomic.commit()).ok;
-    }
-
-    // If we're in a retry and succeeded, we may have blocked some regular updates in the meantime,
-    // and need to queue up a regular update.
-    const nextRetryId = retryList.length > 0 ? Math.floor(Math.random() * 2 ** 50) : null;
-    ok = false;
-    while (!ok) {
-        const atomic = kv.atomic();
-        // If we're in a regular update, we need to check if another regular update
-        // has queued up a retry already.
-        if (retryId.value === null) {
-            const nowRetryId = await kv.get(["nextRetryId"]);
-            if (nowRetryId.value !== null) {
-                break;
-            }
-            atomic.check(nowRetryId);
+        if ((await atomic.commit()).ok) {
+            break;
         }
-        atomic.set(["nextRetryId"], nextRetryId);
-        // TODO exponential backoff or sth idk
-        atomic.enqueue({
-            kind: "update",
-            retryId: nextRetryId,
-            delay: nextRetryId === null ? 0 : 60000
-        });
-        ok = (await atomic.commit()).ok;
     }
 });
