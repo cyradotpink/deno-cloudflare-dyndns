@@ -1,18 +1,11 @@
 import { decodeBase64 } from "https://deno.land/std@0.218.2/encoding/base64.ts";
 import * as cf from "./cloudflare.js";
+import * as util from "./util.js";
 
 const textDecoder = new TextDecoder();
 const kv = await Deno.openKv(Deno.env.get("KV_PATH"));
-let config;
-{
-    const configLocation = Deno.env.get("CONFIG_JS_PATH");
-    if (configLocation !== undefined) {
-        config = (await import(configLocation)).default;
-    } else {
-        config = JSON.parse(Deno.env.get("CONFIG_JSON"));
-    }
-}
-console.log("Hello from global scope! Current config:", config);
+const config = await util.getConfig();
+console.log("Hello from top level! Current config:", config);
 
 Deno.serve(async req => {
     const url = new URL(req.url);

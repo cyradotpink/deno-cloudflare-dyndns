@@ -1,5 +1,7 @@
 import cfApi from "npm:cloudflare@2.9.1";
-const cf = cfApi({ token: "nxqa3Uftb42jq13Epdj7CHGdaFTpmliLIrmrkqH7" });
+import * as util from "./util.js";
+
+const cf = cfApi({ token: (await util.getConfig()).secrets.cloudflare });
 
 export const findZone = async (zCache, name) => {
     const zoneName = name.split(".").slice(-2).join(".");
