@@ -170,10 +170,9 @@ kv.listenQueue(async message => {
             .map(([title, info]) =>
                 info.length === 0
                     ? null
-                    : `${title}:\n` +
-                      info
+                    : `${title}:\n${info
                           .map(v => `${v.recordName} (${v.recordType}) to ${v.recordContent}`)
-                          .join("\n")
+                          .join("\n")}`
             )
             .filter(v => v !== null)
             .join("\n\n") || "Uhhh nothing?";
