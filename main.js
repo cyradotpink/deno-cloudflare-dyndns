@@ -149,7 +149,7 @@ kv.listenQueue(async message => {
             console.log("successful update for", recordName, recordType, recordContent);
         } catch (err) {
             console.log("caught error", err);
-            // TODO cause a retry on other conditions, like network failures?
+            // TODO cause a retry on other conditions, like network failures or ratelimiting
             if (err?.statusCode === 500) {
                 break;
             } else {
