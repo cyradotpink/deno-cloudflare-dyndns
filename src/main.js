@@ -1,6 +1,7 @@
 import { decodeBase64 } from "https://deno.land/std@0.218.2/encoding/base64.ts";
 import * as cf from "./cloudflare.js";
 import * as util from "./util.js";
+import * as discord from "./discord.js";
 
 const textDecoder = new TextDecoder();
 const kv = await Deno.openKv(Deno.env.get("KV_PATH"));
@@ -70,7 +71,7 @@ Deno.serve(async req => {
                     atomic.set(["toUpdate", hostname, "AAAA"], newIpv6);
                 }
                 if ((nameConfig.v6alt ?? null) !== null) {
-                    atomic.set(["toUpdate", nameConfig, "AAAA"], newIpv6);
+                    atomic.set(["toUpdate", nameConfig.v6alt, "AAAA"], newIpv6);
                 }
             }
         }
@@ -122,9 +123,11 @@ kv.listenQueue(async message => {
     // the queue listener never gets unlocked and is broken forever
 
     const commitPromises = [];
+    const info = { success: [], failure: [], notFound: [] };
     // TODO we might want to be smarter about caching than this
     const zCache = {};
     const rCache = {};
+    // TODO we could make cloudflare api requests in batches, instead of sequentially
     for (const entry of toUpdateEntries) {
         const recordContent = entry.value;
         const recordName = entry.key[1];
@@ -133,24 +136,49 @@ kv.listenQueue(async message => {
         try {
             const record = await cf.findRecord(zCache, rCache, recordName, recordType);
             if (record === null) {
-                console.log("skipping record because not found", recordName, recordType);
+                info.notFound.push({ recordName, recordType, recordContent });
                 commitPromises.push(kv.atomic().check(entry).delete(entry.key).commit());
                 continue;
             }
             record.content = recordContent;
             await cf.updateRecord(rCache, record);
-            console.log("successful update for", recordName, recordType, recordContent);
+            info.success.push({ recordName, recordType, recordContent });
         } catch (err) {
             console.log("caught error", err);
             // TODO cause a retry on other conditions, like network failures or ratelimiting
             if (err?.statusCode === 500) {
                 break;
             } else {
-                console.log("error was probably client's fault, ignoring");
+                info.failure.push({ recordName, recordType, recordContent });
             }
         }
         commitPromises.push(kv.atomic().check(entry).delete(entry.key).commit());
     }
+    info.retry = toUpdateEntries
+        .slice(commitPromises.length)
+        .map(v => ({ recordName: v.value, recordType: v.key[2], recordContent: v.key[1] }));
+
+    console.log("updates summary:", info);
+
+    const infoString =
+        [
+            ["Updated", info.success],
+            ["Skipped (Record not found)", info.notFound],
+            ["Failed", info.failure],
+            ["Queued for retry", info.retry]
+        ]
+            .map(([title, info]) =>
+                info.length === 0
+                    ? null
+                    : `${title}:\n` +
+                      info
+                          .map(v => `${v.recordName} (${v.recordType}) to ${v.recordContent}`)
+                          .join("\n")
+            )
+            .filter(v => v !== null)
+            .join("\n\n") || "Uhhh nothing?";
+
+    discord.executeWebhook(infoString);
 
     await Promise.all(commitPromises);
 
