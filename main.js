@@ -63,8 +63,23 @@ Deno.serve(async req => {
     while (!ok) {
         const atomic = kv.atomic();
         for (const hostname of hostNamesToUpdate) {
-            if (newIpv4 !== null) atomic.set(["toUpdate", hostname, "A"], newIpv4);
-            if (newIpv6 !== null) atomic.set(["toUpdate", hostname, "AAAA"], newIpv6);
+            const nameConfig = config.names[hostname];
+            if (newIpv4 !== null) {
+                if (nameConfig.records.includes("A")) {
+                    atomic.set(["toUpdate", hostname, "A"], newIpv4);
+                }
+                if ((nameConfig.v4alt ?? null) !== null) {
+                    atomic.set(["toUpdate", nameConfig.v4alt, "A"], newIpv4);
+                }
+            }
+            if (newIpv6 !== null) {
+                if (nameConfig.records.includes("AAAA")) {
+                    atomic.set(["toUpdate", hostname, "AAAA"], newIpv6);
+                }
+                if ((nameConfig.v6alt ?? null) !== null) {
+                    atomic.set(["toUpdate", nameConfig, "AAAA"], newIpv6);
+                }
+            }
         }
         atomic.enqueue({ kind: "update", nRetry: 0, skipLock: false });
         ok = (await atomic.commit()).ok;
