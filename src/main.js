@@ -9,6 +9,7 @@ const config = await util.getConfig();
 console.log("Hello from top level! Current config:", config);
 
 Deno.serve(async req => {
+    console.log("received request with url", req.url);
     const url = new URL(req.url);
     if (url.pathname !== "/nic/update") {
         return new Response("404", { status: 404 });
@@ -52,6 +53,7 @@ Deno.serve(async req => {
     for (const _ of hostNamesToUpdate) {
         returnCodes.push("good " + [newIpv4, newIpv6].filter(v => v !== null).join(","));
     }
+    const response = returnCodes.join("\n");
 
     let ok = false;
     while (!ok) {
@@ -79,7 +81,8 @@ Deno.serve(async req => {
         ok = (await atomic.commit()).ok;
     }
 
-    return new Response(returnCodes.join("\n"));
+    console.log("Sending response:\n" + response);
+    return new Response(response);
 });
 
 kv.listenQueue(async message => {
