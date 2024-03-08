@@ -126,7 +126,7 @@ kv.listenQueue(async message => {
     // the queue listener never gets unlocked and is broken forever
 
     const commitPromises = [];
-    const info = { success: [], failure: [], notFound: [] };
+    const info = { success: [], unchanged: [], failure: [], notFound: [] };
     // TODO we might want to be smarter about caching than this
     const zCache = {};
     const rCache = {};
@@ -140,6 +140,11 @@ kv.listenQueue(async message => {
             const record = await cf.findRecord(zCache, rCache, recordName, recordType);
             if (record === null) {
                 info.notFound.push({ recordName, recordType, recordContent });
+                commitPromises.push(kv.atomic().check(entry).delete(entry.key).commit());
+                continue;
+            }
+            if (record.content === recordContent) {
+                info.unchanged.push({ recordName, recordType, recordContent });
                 commitPromises.push(kv.atomic().check(entry).delete(entry.key).commit());
                 continue;
             }
@@ -166,6 +171,7 @@ kv.listenQueue(async message => {
     const infoString =
         [
             ["Updated", info.success],
+            ["Unchanged, ignored", info.unchanged],
             ["Skipped (Record not found)", info.notFound],
             ["Failed", info.failure],
             ["Queued for retry", info.retry]
